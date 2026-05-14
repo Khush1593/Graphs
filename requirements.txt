@@ -6,3 +6,7 @@ python-dotenv>=1.0.1
 openai>=1.30.0
 groq>=0.9.0
 google-generativeai>=0.7.2
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+sqlglot>=23.0.0
+pydantic>=2.5.0

@@ -1,17 +1,25 @@
+"""Project state persistence.
+
+State (project metadata, step tracking, artifacts) lives in a relational
+database accessed via SQLAlchemy. Raw uploaded files (CSVs) live in a
+StorageClient — local volume today, S3 tomorrow. The ProjectStore here is the
+single entry point that ties the two together; the rest of the app talks to
+ProjectStore, never to os/pathlib or to a Session directly.
+"""
 from __future__ import annotations
 
-import json
-import os
-import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from app.data_engine import SchemaInfo
+from app.models import Artifact, Project, init_db, session_scope
+from app.storage import StorageClient, build_default_storage
 
-
-PROJECTS_ROOT = "projects"
 
 ARTIFACT_NAMES = (
     "upload_signature",
@@ -27,12 +35,8 @@ ARTIFACT_NAMES = (
 )
 
 
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+def _iso(dt: datetime | None) -> str | None:
+    return dt.isoformat(timespec="seconds") if dt else None
 
 
 def schema_to_dict(schema: SchemaInfo) -> dict:
@@ -57,6 +61,9 @@ def schema_from_dict(data: dict) -> SchemaInfo:
 
 @dataclass
 class ProjectMeta:
+    """Plain view object handed to the UI. Decoupled from the ORM row so
+    Streamlit code never touches a detached Session."""
+
     project_id: str
     name: str
     created_at: str
@@ -70,90 +77,96 @@ class ProjectMeta:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "ProjectMeta":
-        allowed = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+    def from_orm(cls, row: Project) -> "ProjectMeta":
+        return cls(
+            project_id=row.project_id,
+            name=row.name,
+            created_at=_iso(row.created_at) or "",
+            last_modified=_iso(row.last_modified) or "",
+            current_step=row.current_step,
+            upload_filename=row.upload_filename,
+            upload_size=row.upload_size,
+            debug_log_path=row.debug_log_path,
+        )
+
+
+_META_FIELDS = {
+    "name",
+    "current_step",
+    "upload_filename",
+    "upload_size",
+    "debug_log_path",
+}
 
 
 class ProjectStore:
-    def __init__(self, root: str = PROJECTS_ROOT) -> None:
-        self.root = root
-        _ensure_dir(self.root)
+    """Facade over the DB + blob storage. Public surface is unchanged from
+    the legacy JSON-on-disk store so the UI keeps working."""
 
-    def _project_dir(self, project_id: str) -> str:
-        return os.path.join(self.root, project_id)
+    def __init__(
+        self,
+        storage: StorageClient | None = None,
+        *,
+        auto_init_db: bool = True,
+    ) -> None:
+        self.storage: StorageClient = storage or build_default_storage()
+        if auto_init_db:
+            init_db()
 
-    def _meta_path(self, project_id: str) -> str:
-        return os.path.join(self._project_dir(project_id), "metadata.json")
+    # ----- raw-data key helpers -------------------------------------------------
+    @staticmethod
+    def _raw_prefix(project_id: str) -> str:
+        return f"{project_id}/raw_data"
 
-    def _artifacts_dir(self, project_id: str) -> str:
-        return os.path.join(self._project_dir(project_id), "artifacts")
+    @staticmethod
+    def _raw_key(project_id: str, filename: str) -> str:
+        return f"{project_id}/raw_data/{filename}"
 
-    def _raw_dir(self, project_id: str) -> str:
-        return os.path.join(self._project_dir(project_id), "raw_data")
-
-    def _artifact_path(self, project_id: str, name: str) -> str:
-        return os.path.join(self._artifacts_dir(project_id), f"{name}.json")
-
+    # ----- projects -------------------------------------------------------------
     def create_project(self, name: str | None = None) -> ProjectMeta:
         project_id = uuid4().hex[:12]
-        now = _now_iso()
-        meta = ProjectMeta(
-            project_id=project_id,
-            name=(name or "").strip() or f"project_{project_id}",
-            created_at=now,
-            last_modified=now,
-            current_step=1,
-        )
-        _ensure_dir(self._project_dir(project_id))
-        _ensure_dir(self._artifacts_dir(project_id))
-        _ensure_dir(self._raw_dir(project_id))
-        self._save_meta(meta)
-        return meta
+        now = datetime.utcnow()
+        with session_scope() as s:
+            row = Project(
+                project_id=project_id,
+                name=(name or "").strip() or f"project_{project_id}",
+                created_at=now,
+                last_modified=now,
+                current_step=1,
+            )
+            s.add(row)
+            s.flush()
+            return ProjectMeta.from_orm(row)
 
     def list_projects(self) -> list[ProjectMeta]:
-        if not os.path.isdir(self.root):
-            return []
-        projects: list[ProjectMeta] = []
-        for entry in os.listdir(self.root):
-            meta_path = os.path.join(self.root, entry, "metadata.json")
-            if os.path.isfile(meta_path):
-                try:
-                    with open(meta_path) as f:
-                        projects.append(ProjectMeta.from_dict(json.load(f)))
-                except Exception:
-                    continue
-        projects.sort(key=lambda p: p.last_modified, reverse=True)
-        return projects
+        with session_scope() as s:
+            rows = s.execute(
+                select(Project).order_by(Project.last_modified.desc())
+            ).scalars().all()
+            return [ProjectMeta.from_orm(r) for r in rows]
 
     def get_meta(self, project_id: str) -> ProjectMeta | None:
-        path = self._meta_path(project_id)
-        if not os.path.isfile(path):
-            return None
-        with open(path) as f:
-            return ProjectMeta.from_dict(json.load(f))
-
-    def _save_meta(self, meta: ProjectMeta) -> None:
-        _ensure_dir(self._project_dir(meta.project_id))
-        with open(self._meta_path(meta.project_id), "w") as f:
-            json.dump(meta.to_dict(), f, indent=2)
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            return ProjectMeta.from_orm(row) if row else None
 
     def update_meta(
         self,
         project_id: str,
         bump_modified: bool = True,
-        **fields,
+        **fields: Any,
     ) -> ProjectMeta:
-        meta = self.get_meta(project_id)
-        if meta is None:
-            raise ValueError(f"Project {project_id} not found")
-        for key, value in fields.items():
-            if hasattr(meta, key):
-                setattr(meta, key, value)
-        if bump_modified:
-            meta.last_modified = _now_iso()
-        self._save_meta(meta)
-        return meta
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            if row is None:
+                raise ValueError(f"Project {project_id} not found")
+            for key, value in fields.items():
+                if key in _META_FIELDS:
+                    setattr(row, key, value)
+            if bump_modified:
+                row.last_modified = datetime.utcnow()
+            s.flush()
+            return ProjectMeta.from_orm(row)
 
     def rename_project(self, project_id: str, new_name: str) -> ProjectMeta:
         clean = (new_name or "").strip()
@@ -162,63 +175,120 @@ class ProjectStore:
         return self.update_meta(project_id, name=clean)
 
     def delete_project(self, project_id: str) -> None:
-        path = self._project_dir(project_id)
-        if os.path.isdir(path):
-            shutil.rmtree(path)
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            if row is not None:
+                s.delete(row)
+        # Blob deletion lives outside the DB transaction; if it fails the row
+        # is already gone, which matches the prior on-disk behaviour.
+        self.storage.delete_prefix(project_id)
 
+    # ----- artifacts ------------------------------------------------------------
     def save_artifact(self, project_id: str, name: str, data: Any) -> None:
-        _ensure_dir(self._artifacts_dir(project_id))
-        with open(self._artifact_path(project_id, name), "w") as f:
-            json.dump(data, f, indent=2, default=str)
-        self.update_meta(project_id)
+        now = datetime.utcnow()
+        with session_scope() as s:
+            self._upsert_artifact(s, project_id, name, data, now)
+            row = s.get(Project, project_id)
+            if row is not None:
+                row.last_modified = now
+
+    @staticmethod
+    def _upsert_artifact(
+        s: Session,
+        project_id: str,
+        name: str,
+        data: Any,
+        now: datetime,
+    ) -> None:
+        existing = s.execute(
+            select(Artifact).where(
+                Artifact.project_id == project_id, Artifact.name == name
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            s.add(Artifact(project_id=project_id, name=name, data=data, updated_at=now))
+        else:
+            existing.data = data
+            existing.updated_at = now
 
     def load_artifact(self, project_id: str, name: str) -> Any | None:
-        path = self._artifact_path(project_id, name)
-        if not os.path.isfile(path):
-            return None
-        with open(path) as f:
-            return json.load(f)
+        with session_scope() as s:
+            row = s.execute(
+                select(Artifact).where(
+                    Artifact.project_id == project_id, Artifact.name == name
+                )
+            ).scalar_one_or_none()
+            return row.data if row else None
 
     def has_artifact(self, project_id: str, name: str) -> bool:
-        return os.path.isfile(self._artifact_path(project_id, name))
+        with session_scope() as s:
+            row = s.execute(
+                select(Artifact.id).where(
+                    Artifact.project_id == project_id, Artifact.name == name
+                )
+            ).first()
+            return row is not None
 
     def delete_artifact(self, project_id: str, name: str) -> None:
-        path = self._artifact_path(project_id, name)
-        if os.path.isfile(path):
-            os.remove(path)
+        with session_scope() as s:
+            row = s.execute(
+                select(Artifact).where(
+                    Artifact.project_id == project_id, Artifact.name == name
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                s.delete(row)
 
     def clear_artifacts(self, project_id: str) -> None:
-        artifacts_dir = self._artifacts_dir(project_id)
-        if os.path.isdir(artifacts_dir):
-            shutil.rmtree(artifacts_dir)
-        _ensure_dir(artifacts_dir)
+        with session_scope() as s:
+            rows = s.execute(
+                select(Artifact).where(Artifact.project_id == project_id)
+            ).scalars().all()
+            for row in rows:
+                s.delete(row)
 
+    # ----- raw uploaded data ----------------------------------------------------
     def save_raw_data(
         self,
         project_id: str,
         file_bytes: bytes,
         filename: str,
     ) -> str:
-        raw_dir = self._raw_dir(project_id)
-        # Replace any prior raw data so projects always have a single source CSV.
-        if os.path.isdir(raw_dir):
-            shutil.rmtree(raw_dir)
-        _ensure_dir(raw_dir)
-        path = os.path.join(raw_dir, filename)
-        with open(path, "wb") as f:
-            f.write(file_bytes)
-        return path
+        # A project always has exactly one source CSV: wipe prior files first.
+        self.storage.delete_prefix(self._raw_prefix(project_id))
+        key = self._raw_key(project_id, filename)
+        self.storage.put(key, file_bytes)
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            if row is None:
+                raise ValueError(f"Project {project_id} not found")
+            row.raw_data_key = key
+            row.upload_filename = filename
+            row.upload_size = len(file_bytes)
+            row.last_modified = datetime.utcnow()
+        return self.storage.resolve(key)
 
     def load_raw_data(self, project_id: str) -> tuple[bytes, str] | None:
-        raw_dir = self._raw_dir(project_id)
-        if not os.path.isdir(raw_dir):
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            key = row.raw_data_key if row else None
+            filename = row.upload_filename if row else None
+        if not key or not self.storage.exists(key):
             return None
-        files = sorted(os.listdir(raw_dir))
-        if not files:
-            return None
-        filename = files[0]
-        with open(os.path.join(raw_dir, filename), "rb") as f:
-            return f.read(), filename
+        data = self.storage.get(key)
+        return data, (filename or key.rsplit("/", 1)[-1])
 
     def has_raw_data(self, project_id: str) -> bool:
-        return self.load_raw_data(project_id) is not None
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            key = row.raw_data_key if row else None
+        return bool(key and self.storage.exists(key))
+
+    def raw_data_path(self, project_id: str) -> str | None:
+        """Return a backend-resolved identifier (local path / S3 URI) for the
+        raw CSV. data_engine and downstream tooling should call this rather
+        than constructing paths themselves."""
+        with session_scope() as s:
+            row = s.get(Project, project_id)
+            key = row.raw_data_key if row else None
+        return self.storage.resolve(key) if key else None

@@ -9,7 +9,23 @@ import google.generativeai as genai
 from groq import Groq
 from openai import OpenAI
 
+import duckdb
+import pandas as pd
+from pydantic import BaseModel, ValidationError
+
 from app.config import settings
+from app.data_engine import execute_select_query
+from app.schemas import (
+    ClarificationQuestionsResponse,
+    DashboardPlanResponse,
+    GoalsResponse,
+    UnderstandingResponse,
+)
+from app.sql_safety import (
+    DEFAULT_ALLOWED_TABLES,
+    DEFAULT_MAX_ROWS,
+    SQLValidationError,
+)
 
 
 LLM_TIMEOUT_SECONDS = 120
@@ -186,6 +202,145 @@ def _extract_json_object(text: str) -> str:
     return match.group(0)
 
 
+# ---------------------------------------------------------------------------
+# Structured-output layer
+# ---------------------------------------------------------------------------
+
+
+class LLMStructuredOutputError(Exception):
+    """Raised when the LLM's response cannot be validated against the expected
+    Pydantic schema even after retries.
+
+    ``model_name`` identifies which schema we were trying to fill; ``cause``
+    is the last ValidationError / JSONDecodeError observed; ``raw`` is the
+    final unparseable response. The UI can use these to display a clean
+    error or trigger a deterministic fallback (e.g. the rule-based dashboard
+    planner).
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        message: str,
+        *,
+        cause: Exception | None = None,
+        raw: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.model_name = model_name
+        self.cause = cause
+        self.raw = raw
+
+
+def _structured_once(prompt: str, model_cls: type[BaseModel]) -> str:
+    """Single LLM round-trip that requests JSON conforming to ``model_cls``.
+
+    OpenAI gets the native ``response_format={"type":"json_schema", ...}``
+    feature, which the API enforces server-side. Groq supports
+    ``json_object`` mode (schema-less JSON), and Gemini accepts
+    ``response_mime_type="application/json"``. In all three cases the model
+    must emit JSON; we then validate it client-side with Pydantic — which is
+    the only contract we trust regardless of provider.
+    """
+    provider = settings.llm_provider
+
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is missing.")
+        client = OpenAI(api_key=settings.openai_api_key, timeout=LLM_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=settings.openai_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": model_cls.__name__,
+                    "schema": model_cls.model_json_schema(),
+                },
+            },
+        )
+        return response.choices[0].message.content or ""
+
+    if provider == "groq":
+        if not settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is missing.")
+        client = Groq(api_key=settings.groq_api_key, timeout=LLM_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=settings.groq_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content or ""
+
+    if provider == "gemini":
+        if not settings.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is missing.")
+        genai.configure(api_key=settings.gemini_api_key)
+        model = genai.GenerativeModel(settings.gemini_model)
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": LLM_TIMEOUT_SECONDS},
+            generation_config={"response_mime_type": "application/json"},
+        )
+        return response.text or ""
+
+    raise ValueError("Unsupported LLM_PROVIDER. Use openai, gemini, or groq.")
+
+
+_STRUCTURED_RETRYABLE = (ValidationError, json.JSONDecodeError, ValueError)
+
+
+def _generate_structured(
+    prompt: str,
+    model_cls: type[BaseModel],
+    *,
+    max_attempts: int = LLM_MAX_ATTEMPTS,
+) -> BaseModel:
+    """Call the LLM and validate against ``model_cls``.
+
+    Retries on:
+      - transient provider errors (rate limits, timeouts) — same policy as
+        ``_generate_text``.
+      - schema validation failures and malformed JSON — we reissue the call
+        because temperature=0 makes raw "the model is confused" failures
+        rare; usually a retry with the same prompt resolves them.
+
+    On terminal failure raises ``LLMStructuredOutputError`` so callers can
+    decide between hard-failing the UI and using a deterministic fallback.
+    """
+    last_exc: Exception | None = None
+    last_raw: str | None = None
+    for attempt in range(max_attempts):
+        try:
+            last_raw = _structured_once(prompt, model_cls)
+            if not last_raw or not last_raw.strip():
+                raise ValueError(f"Empty LLM response for {model_cls.__name__}.")
+            return model_cls.model_validate_json(last_raw)
+        except _STRUCTURED_RETRYABLE as exc:
+            last_exc = exc
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(LLM_BACKOFF_BASE_SECONDS ** (attempt + 1))
+        except Exception as exc:
+            # Provider-level network / rate-limit errors flow through here.
+            last_exc = exc
+            if not _is_transient_error(exc):
+                raise
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(LLM_BACKOFF_BASE_SECONDS ** (attempt + 1))
+
+    raise LLMStructuredOutputError(
+        model_cls.__name__,
+        f"LLM output failed validation against {model_cls.__name__} after "
+        f"{max_attempts} attempts: {last_exc}",
+        cause=last_exc,
+        raw=last_raw,
+    )
+
+
 def resolve_active_model() -> str:
     provider = settings.llm_provider
     if provider == "openai":
@@ -247,9 +402,9 @@ def generate_goals(input_data: dict) -> list[dict]:
         "time_granularity, comparison_window)\n\n"
         f"Inputs:\n{json.dumps(input_data, ensure_ascii=True, default=str)}\n\n"
         "Produce 3 to 5 STRUCTURED goals that downstream code can use directly to plan charts "
-        "and prioritize insights. Output JSON ARRAY only — no markdown fences, no commentary. "
-        "All in English.\n\n"
-        "Each goal object MUST have these keys:\n"
+        "and prioritize insights. Output a single JSON object of the form "
+        "{\"goals\": [ ... ]}. No markdown fences, no commentary. All in English.\n\n"
+        "Each entry in the goals array MUST have these keys:\n"
         "- id: short stable string (e.g. \"g_revenue_growth\").\n"
         "- title: short user-facing goal text (under 100 chars).\n"
         "- metric: column name from understanding.measure_columns. NEVER invent.\n"
@@ -273,15 +428,8 @@ def generate_goals(input_data: dict) -> list[dict]:
         "- Never reference identifier_columns or the time_column as a metric or dimension.\n"
     )
 
-    raw = _generate_text(prompt)
-    if not raw or not raw.strip():
-        raise ValueError("Empty LLM response for goals.")
-
-    json_text = _extract_json_array(raw)
-    parsed = json.loads(json_text)
-    if not isinstance(parsed, list):
-        raise ValueError("Goals output is not a JSON array.")
-    return parsed
+    response = _generate_structured(prompt, GoalsResponse)
+    return [g.model_dump(mode="json") for g in response.goals]
 
 
 def generate_clarifications(input_data: dict) -> list[dict]:
@@ -296,8 +444,9 @@ def generate_clarifications(input_data: dict) -> list[dict]:
         "You will receive a structured 'understanding' object with the columns, measures, "
         "dimensions, time scope, and business domain already classified. Use ONLY these.\n\n"
         f"Understanding:\n{json.dumps(input_data, ensure_ascii=True, default=str)}\n\n"
-        "Output JSON ARRAY only (no markdown fences, no commentary). All in English.\n\n"
-        "Each question object MUST have these keys:\n"
+        "Output a single JSON object of the form {\"questions\": [ ... ]}. "
+        "No markdown fences, no commentary. All in English.\n\n"
+        "Each entry in the questions array MUST have these keys:\n"
         "- id: short stable string id (e.g. \"q_primary_goal\").\n"
         "- key: snake_case key. Use EXACTLY one of: primary_goal, focus_metric, focus_dimensions, "
         "time_granularity, comparison_window, decision_to_make, known_events, audience.\n"
@@ -328,15 +477,8 @@ def generate_clarifications(input_data: dict) -> list[dict]:
         "- Never invent column names. Every column referenced must appear in the understanding.\n"
     )
 
-    raw = _generate_text(prompt)
-    if not raw or not raw.strip():
-        raise ValueError("Empty LLM response for clarification questions.")
-
-    json_text = _extract_json_array(raw)
-    parsed = json.loads(json_text)
-    if not isinstance(parsed, list):
-        raise ValueError("Clarification questions output is not a JSON array.")
-    return parsed
+    response = _generate_structured(prompt, ClarificationQuestionsResponse)
+    return [q.model_dump(mode="json") for q in response.questions]
 
 
 def generate_dataset_understanding(input_data: dict) -> dict:
@@ -380,14 +522,8 @@ def generate_dataset_understanding(input_data: dict) -> dict:
         "- Keep all text fields concise — this is structured input for other AI stages, not a report.\n"
     )
 
-    raw = _generate_text(prompt)
-    if not raw or not raw.strip():
-        raise ValueError("Empty LLM response for dataset understanding.")
-
-    json_text = _extract_json_object(raw)
-    parsed = json.loads(json_text)
-    if not isinstance(parsed, dict):
-        raise ValueError("Dataset understanding output is not a JSON object.")
+    response = _generate_structured(prompt, UnderstandingResponse)
+    parsed = response.model_dump(mode="json")
     return parsed
 
 
@@ -407,6 +543,216 @@ def generate_sql(
     )
     text = _generate_text(prompt)
     return _normalize_sql(text)
+
+
+# ---------------------------------------------------------------------------
+# Self-correction loop
+# ---------------------------------------------------------------------------
+
+# Validation failures we trust the LLM to fix if we tell it what it got wrong.
+RETRYABLE_VALIDATION_CODES = frozenset({
+    "parse_error",
+    "unknown_column",
+    "disallowed_table",
+    "non_select_root",
+    "empty_query",
+})
+
+# Failures that signal either malice or fundamentally broken intent. We do NOT
+# give the LLM another shot at these — bail and surface to the UI.
+HARD_FAIL_VALIDATION_CODES = frozenset({
+    "destructive_statement",
+    "multiple_statements",
+})
+
+QA_DEFAULT_MAX_ATTEMPTS = 3
+
+
+class QARetryExhausted(Exception):
+    """Raised when the self-correction loop runs out of attempts.
+
+    Carries the per-attempt transcript so the UI / debug log can show
+    exactly what the LLM tried and how each attempt was rejected.
+    """
+
+    def __init__(self, message: str, *, attempts: list[dict]) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def _chat_once(messages: list[dict]) -> str:
+    """Single LLM round-trip that accepts a multi-turn message history.
+
+    OpenAI/Groq take the OpenAI chat format natively. Gemini's SDK does
+    support multi-turn via start_chat(), but for retry feedback the
+    flattened transcript is equivalent and avoids leaking provider-specific
+    state through this module.
+    """
+    provider = settings.llm_provider
+
+    if provider == "openai":
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is missing.")
+        client = OpenAI(api_key=settings.openai_api_key, timeout=LLM_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=settings.openai_model,
+            messages=messages,
+            temperature=0,
+        )
+        return response.choices[0].message.content or ""
+
+    if provider == "groq":
+        if not settings.groq_api_key:
+            raise ValueError("GROQ_API_KEY is missing.")
+        client = Groq(api_key=settings.groq_api_key, timeout=LLM_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=settings.groq_model,
+            messages=messages,
+            temperature=0,
+        )
+        return response.choices[0].message.content or ""
+
+    if provider == "gemini":
+        if not settings.gemini_api_key:
+            raise ValueError("GEMINI_API_KEY is missing.")
+        genai.configure(api_key=settings.gemini_api_key)
+        model = genai.GenerativeModel(settings.gemini_model)
+        flattened = "\n\n".join(
+            f"[{m['role'].upper()}]\n{m['content']}" for m in messages
+        )
+        response = model.generate_content(
+            flattened,
+            request_options={"timeout": LLM_TIMEOUT_SECONDS},
+        )
+        return response.text or ""
+
+    raise ValueError("Unsupported LLM_PROVIDER. Use openai, gemini, or groq.")
+
+
+def _chat(messages: list[dict]) -> str:
+    """Chat wrapper with the same transient-error retry policy as _generate_text."""
+    last_exc: Exception | None = None
+    for attempt in range(LLM_MAX_ATTEMPTS):
+        try:
+            return _chat_once(messages)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_error(exc):
+                raise
+            if attempt + 1 >= LLM_MAX_ATTEMPTS:
+                break
+            time.sleep(LLM_BACKOFF_BASE_SECONDS ** (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _build_correction_message(
+    error: SQLValidationError,
+    schema_columns: List[str],
+) -> str:
+    schema_list = ", ".join(schema_columns)
+    hint = ""
+    if error.code == "unknown_column" and error.details.get("columns"):
+        hint = (
+            f" The following column(s) do not exist: "
+            f"{', '.join(error.details['columns'])}."
+        )
+    elif error.code == "disallowed_table" and error.details.get("table"):
+        hint = (
+            f" You referenced table {error.details['table']!r}; only "
+            f"{error.details.get('allowed')} are queryable."
+        )
+    return (
+        f"Your previous query failed validation: {error}.{hint} "
+        f"Please rewrite the SQL using ONLY the allowed schema columns: "
+        f"[{schema_list}]. The only queryable table is 'data'. "
+        "Return SQL only, no explanation."
+    )
+
+
+def answer_question_with_self_correction(
+    con: "duckdb.DuckDBPyConnection",
+    question: str,
+    schema_columns: List[str],
+    *,
+    semantic_hints: dict | None = None,
+    context_block: dict | None = None,
+    column_types: dict | None = None,
+    allowed_tables: tuple[str, ...] = DEFAULT_ALLOWED_TABLES,
+    max_rows: int = DEFAULT_MAX_ROWS,
+    max_attempts: int = QA_DEFAULT_MAX_ATTEMPTS,
+) -> tuple["pd.DataFrame", str, list[dict]]:
+    """Run the Q&A flow with up to ``max_attempts`` LLM self-corrections.
+
+    Returns ``(dataframe, final_sql, transcript)``. ``transcript`` is a list
+    of per-attempt dicts (sql + outcome) suitable for debug logging.
+
+    Raises:
+        SQLValidationError: when the LLM produces a destructive or
+            multi-statement query. We do NOT retry these.
+        QARetryExhausted: when retryable validation failures consume all
+            attempts. ``.attempts`` holds the full transcript.
+    """
+    initial_prompt = _build_prompt(
+        schema_columns,
+        question,
+        semantic_hints=semantic_hints,
+        context_block=context_block,
+        column_types=column_types,
+    )
+    messages: list[dict] = [{"role": "user", "content": initial_prompt}]
+    transcript: list[dict] = []
+
+    for attempt_idx in range(max_attempts):
+        raw = _chat(messages)
+        sql = _normalize_sql(raw)
+        record: dict = {"attempt": attempt_idx + 1, "sql": sql}
+        transcript.append(record)
+
+        try:
+            df = execute_select_query(
+                con,
+                sql,
+                allowed_columns=schema_columns,
+                allowed_tables=allowed_tables,
+                max_rows=max_rows,
+            )
+        except SQLValidationError as err:
+            record["error_code"] = err.code
+            record["error_message"] = str(err)
+            record["error_details"] = err.details
+
+            if err.code in HARD_FAIL_VALIDATION_CODES:
+                # Malicious or fundamentally broken — do not let the LLM keep
+                # poking at it. Surface to the UI immediately.
+                raise
+
+            if err.code not in RETRYABLE_VALIDATION_CODES:
+                # Unknown code — be conservative and stop rather than loop
+                # forever on something we don't know how to coach.
+                raise
+
+            # Maintain conversation context: the LLM sees its own previous
+            # SQL and the structured correction prompt.
+            messages.append({"role": "assistant", "content": sql})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _build_correction_message(err, schema_columns),
+                }
+            )
+            continue
+        else:
+            record["status"] = "ok"
+            record["row_count"] = len(df)
+            return df, sql, transcript
+
+    raise QARetryExhausted(
+        f"The AI couldn't formulate a valid query for this dataset after "
+        f"{max_attempts} attempts. Try rephrasing your question or check "
+        f"that your dataset contains the columns you expect.",
+        attempts=transcript,
+    )
 
 
 def suggest_dashboard_plan(
@@ -446,9 +792,9 @@ def suggest_dashboard_plan(
         f"Detected category column: {category_column}\n\n"
         f"{semantic_block}"
         f"{context_block}"
-        "Return ONLY a JSON array (no explanation) with up to "
-        f"{max_items} objects.\n"
-        "Each object MUST have keys: kind, title, sql.\n"
+        "Return ONLY a JSON object of the form {\"items\": [ ... ]} with up to "
+        f"{max_items} entries (no explanation).\n"
+        "Each entry MUST have keys: kind, title, sql.\n"
         "Allowed kind values: kpi, line, bar, hist.\n"
         "Rules:\n"
         "- SQL must be a single SELECT statement from table data\n"
@@ -460,13 +806,8 @@ def suggest_dashboard_plan(
         "- Prioritize useful diversity instead of repetitive charts\n"
     )
 
-    raw_text = _generate_text(prompt)
-    json_text = _extract_json_array(raw_text)
-    parsed = json.loads(json_text)
-
-    if not isinstance(parsed, list):
-        raise ValueError("Dashboard plan should be a JSON list.")
-    return parsed
+    response = _generate_structured(prompt, DashboardPlanResponse)
+    return [item.model_dump(mode="json") for item in response.items]
 
 
 def generate_insight_narrative(

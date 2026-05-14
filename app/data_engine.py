@@ -3,10 +3,16 @@ from __future__ import annotations
 import os
 import tempfile
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, Iterable, List
 
 import duckdb
 import pandas as pd
+
+from app.sql_safety import (
+    DEFAULT_ALLOWED_TABLES,
+    DEFAULT_MAX_ROWS,
+    validate_select_sql,
+)
 
 
 @dataclass
@@ -100,7 +106,21 @@ def detect_schema(df: pd.DataFrame) -> SchemaInfo:
     )
 
 
-def execute_select_query(con: duckdb.DuckDBPyConnection, sql: str) -> pd.DataFrame:
-    if not sql.strip().lower().startswith("select"):
-        raise ValueError("Only SELECT queries are allowed.")
-    return con.execute(sql).df()
+def execute_select_query(
+    con: duckdb.DuckDBPyConnection,
+    sql: str,
+    *,
+    allowed_columns: Iterable[str],
+    allowed_tables: Iterable[str] = DEFAULT_ALLOWED_TABLES,
+    max_rows: int = DEFAULT_MAX_ROWS,
+) -> pd.DataFrame:
+    """Validate the SQL against the active schema, cap its result set, then
+    execute. Raises sql_safety.SQLValidationError on rejection so the caller
+    can either retry the LLM or surface a structured error."""
+    safe_sql = validate_select_sql(
+        sql,
+        allowed_columns=allowed_columns,
+        allowed_tables=allowed_tables,
+        max_rows=max_rows,
+    )
+    return con.execute(safe_sql).df()

@@ -22,10 +22,15 @@ from app.goal_engine import (
     normalize_user_goals,
 )
 from app.insight_engine import generate_deterministic_insight_text, generate_insight_signals_v2
-from app.llm_engine import generate_insight_narrative, generate_sql
+from app.llm_engine import (
+    answer_question_with_self_correction,
+    generate_insight_narrative,
+    generate_sql,
+    QARetryExhausted,
+)
 from app.persistence import ProjectStore, schema_from_dict, schema_to_dict
 from app.semantic_engine import infer_semantic_hints
-from app.sql_safety import is_safe_query
+from app.sql_safety import SQLValidationError
 from app.understanding_engine import generate_understanding
 
 
@@ -935,7 +940,11 @@ kpi_cursor = 0
 
 for item in dashboard_plan:
     try:
-        result = execute_select_query(st.session_state.con, item.sql)
+        result = execute_select_query(
+            st.session_state.con,
+            item.sql,
+            allowed_columns=st.session_state.schema.columns,
+        )
     except Exception as sql_exc:
         st.session_state.debug_logger.log_event(
             "dashboard_query_failed",
@@ -1010,37 +1019,46 @@ if st.button("Run Question") and question.strip():
             },
         )
         understanding_summary = (st.session_state.understanding or {}).get("summary", {})
-        sql = generate_sql(
-            question,
-            schema.columns,
-            semantic_hints=semantic_hints,
-            context_block=context_prompt_block,
-            column_types={
-                "identifier_columns": understanding_summary.get("identifier_columns") or [],
-                "measure_columns": understanding_summary.get("measure_columns") or [],
-                "dimension_columns": understanding_summary.get("dimension_columns") or [],
-                "time_column": context.time_column,
-            },
-        )
-        st.code(sql, language="sql")
-        st.session_state.debug_logger.log_event(
-            "qa_sql_generated",
-            {
-                "question": question,
-                "sql": sql,
-                "semantic_hints": semantic_hints,
-                "context_used": True,
-            },
-        )
-
-        if not is_safe_query(sql):
+        try:
+            answer_df, sql, transcript = answer_question_with_self_correction(
+                st.session_state.con,
+                question,
+                schema.columns,
+                semantic_hints=semantic_hints,
+                context_block=context_prompt_block,
+                column_types={
+                    "identifier_columns": understanding_summary.get("identifier_columns") or [],
+                    "measure_columns": understanding_summary.get("measure_columns") or [],
+                    "dimension_columns": understanding_summary.get("dimension_columns") or [],
+                    "time_column": context.time_column,
+                },
+            )
+        except SQLValidationError as safety_exc:
+            # Hard-fail codes (destructive_statement, multiple_statements) bypass retries.
             st.session_state.debug_logger.log_event(
                 "qa_sql_blocked",
-                {"question": question, "sql": sql, "reason": "unsafe_query"},
+                {
+                    "question": question,
+                    "reason": safety_exc.code,
+                    "details": safety_exc.details,
+                },
             )
-            st.error("Generated SQL blocked by safety layer.")
+            st.error(f"Generated SQL blocked by safety layer ({safety_exc.code}).")
+        except QARetryExhausted as retry_exc:
+            st.session_state.debug_logger.log_event(
+                "qa_retry_exhausted",
+                {"question": question, "attempts": retry_exc.attempts},
+            )
+            st.error(str(retry_exc))
+            with st.expander("Attempts the AI tried"):
+                for record in retry_exc.attempts:
+                    st.code(record.get("sql", ""), language="sql")
+                    if record.get("error_code"):
+                        st.caption(
+                            f"Rejected: {record['error_code']} — {record.get('error_message', '')}"
+                        )
         else:
-            answer_df = execute_select_query(st.session_state.con, sql)
+            st.code(sql, language="sql")
             st.session_state.debug_logger.log_event(
                 "qa_sql_executed",
                 {
@@ -1048,8 +1066,11 @@ if st.button("Run Question") and question.strip():
                     "sql": sql,
                     "row_count": len(answer_df),
                     "columns": list(answer_df.columns),
+                    "attempts": transcript,
                 },
             )
+            if len(transcript) > 1:
+                st.caption(f"AI self-corrected after {len(transcript) - 1} retry(ies).")
             st.dataframe(answer_df, use_container_width=True)
     except Exception as exc:
         st.session_state.debug_logger.log_event(

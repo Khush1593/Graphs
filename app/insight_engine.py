@@ -36,6 +36,19 @@ GROWTH_THRESHOLDS = {
     "quarterly": {"opportunity": 20, "decline": -12, "improvement": -20, "unwanted": 12, "instability": 15},
 }
 
+# --- Statistical guardrails -------------------------------------------------
+# Below this many valid rows we don't compute outliers at all. IQR is robust
+# but still nonsense on a handful of points; small samples produce false
+# positives that erode trust in the narrator.
+MIN_ROWS_FOR_STATS = 30
+
+# Tukey's fence multiplier. 1.5 * IQR is the textbook "mild outlier" bound;
+# anything beyond that gets surfaced. Values >= 3 IQRs from the median are
+# treated as extreme for priority scoring.
+ANOMALY_IQR_MULTIPLIER = 1.5
+EXTREME_IQR_DISTANCE = 3.0
+
+
 PERIOD_PCT_LABELS = {
     "daily": "DoD",
     "weekly": "WoW",
@@ -94,9 +107,45 @@ def _resolve_columns(
 
 
 def _pct_change(current: float, previous: float) -> float | None:
+    """Percentage change, robust to the edges that used to crash callers.
+
+    Returns None for:
+      - missing inputs (None / NaN on either side)
+      - previous == 0 (would be ZeroDivisionError; conceptually undefined or
+        "infinite" growth — we report None rather than ``inf`` so JSON stays
+        finite. Callers that need to distinguish the two cases should use
+        ``_pct_change_with_status``).
+    """
+    if current is None or previous is None:
+        return None
+    try:
+        if pd.isna(current) or pd.isna(previous):
+            return None
+    except (TypeError, ValueError):
+        return None
     if previous == 0:
         return None
     return ((current - previous) / previous) * 100.0
+
+
+def _pct_change_with_status(current: float, previous: float) -> tuple[float | None, str]:
+    """Same math as ``_pct_change`` but reports *why* the result is None.
+
+    Status codes:
+      - ``ok``                — value is a finite percentage
+      - ``missing_input``     — current or previous was None/NaN
+      - ``prev_zero``         — previous was exactly zero (growth undefined)
+    """
+    if current is None or previous is None:
+        return None, "missing_input"
+    try:
+        if pd.isna(current) or pd.isna(previous):
+            return None, "missing_input"
+    except (TypeError, ValueError):
+        return None, "missing_input"
+    if previous == 0:
+        return None, "prev_zero"
+    return ((current - previous) / previous) * 100.0, "ok"
 
 
 def _trend_slope(series: pd.Series) -> float | None:
@@ -386,16 +435,18 @@ def generate_insight_signals_v2(
         primary_periods = _aggregate_by_period(local_df, time_col, metric_col, primary_granularity)
         secondary_periods = _aggregate_by_period(local_df, time_col, metric_col, secondary_granularity)
 
-        primary_pct = None
+        primary_pct: float | None = None
+        primary_pct_status = "insufficient_data"
         if len(primary_periods) >= 2:
-            primary_pct = _pct_change(
+            primary_pct, primary_pct_status = _pct_change_with_status(
                 float(primary_periods.iloc[-1][metric_col]),
                 float(primary_periods.iloc[-2][metric_col]),
             )
 
-        secondary_pct = None
+        secondary_pct: float | None = None
+        secondary_pct_status = "insufficient_data"
         if len(secondary_periods) >= 2:
-            secondary_pct = _pct_change(
+            secondary_pct, secondary_pct_status = _pct_change_with_status(
                 float(secondary_periods.iloc[-1][metric_col]),
                 float(secondary_periods.iloc[-2][metric_col]),
             )
@@ -420,6 +471,12 @@ def generate_insight_signals_v2(
             "secondary_period_label": period_label_secondary,
             "trend_slope": round(slope, 4) if slope is not None else None,
             "direction": "up" if (primary_pct or 0) >= 0 else "down",
+            # Explicit status flags so the narrator can distinguish "we don't
+            # know" (insufficient_data / missing_input) from "growth is
+            # mathematically undefined" (prev_zero) — both manifest as a
+            # null pct but mean very different things downstream.
+            "primary_period_pct_status": primary_pct_status,
+            "secondary_period_pct_status": secondary_pct_status,
             "thresholds_used": thresholds,
             # backwards-compatible aliases for the existing narrator/text functions
             "mom_pct": round(primary_pct, 2) if primary_pct is not None and primary_granularity == "monthly" else None,
@@ -566,99 +623,203 @@ def generate_insight_signals_v2(
     else:
         signals["quality"]["warnings"].append("No categorical dimension available for contributor analysis.")
 
-    mean_val = float(local_df[metric_col].mean())
-    std_val = float(local_df[metric_col].std(ddof=0))
+    # ------------------------------------------------------------------
+    # Anomaly detection — robust IQR method with sample-size gatekeeping.
+    #
+    # Why we changed this:
+    #   * Global Z-scores assume normal data and use the mean/std, both of
+    #     which are pulled around by the very outliers we're trying to find.
+    #     On small or seasonal series this produces alert fatigue.
+    #   * IQR (Tukey's fences) is computed from quantiles, so a single huge
+    #     spike does not move the bounds.
+    #   * On <30 rows even IQR is unreliable; we skip entirely and flag it.
+    #
+    # Output contract: the anomalies dict keeps its existing keys
+    # (method, threshold, count, pct_of_rows, events) plus additive fields.
+    # Event dicts keep date / value / event_type / zscore (now a *robust
+    # score* in units of IQR-from-median) / deviation_pct_from_mean.
+    # ------------------------------------------------------------------
     anomaly_events: list[dict[str, Any]] = []
-    if std_val > 0:
-        z_scores = (local_df[metric_col] - mean_val) / std_val
-        outlier_mask = z_scores.abs() >= 2.5
-        outlier_count = int(outlier_mask.sum())
+    valid_rows = int(len(local_df))
 
+    if valid_rows < MIN_ROWS_FOR_STATS:
+        signals["anomalies"] = {
+            "method": "iqr",
+            "threshold": ANOMALY_IQR_MULTIPLIER,
+            "count": 0,
+            "pct_of_rows": 0.0,
+            "events": [],
+            "anomalies_skipped_due_to_low_volume": True,
+            "min_rows_required": MIN_ROWS_FOR_STATS,
+            "valid_rows": valid_rows,
+        }
+        signals["quality"]["warnings"].append(
+            f"Anomaly detection skipped: only {valid_rows} valid rows "
+            f"(need at least {MIN_ROWS_FOR_STATS})."
+        )
+    else:
+        # When we have a time column, anomalies are most meaningful at the
+        # daily aggregate level (one bar per day) rather than per-row.
+        daily: pd.DataFrame | None = None
         if time_col:
             daily = (
                 local_df.assign(day=local_df[time_col].dt.date)
                 .groupby("day", as_index=False)[metric_col]
                 .sum()
                 .sort_values("day")
+                .reset_index(drop=True)
             )
-            daily_mean = float(daily[metric_col].mean())
-            daily_std = float(daily[metric_col].std(ddof=0))
-            if daily_std > 0:
-                daily["z"] = (daily[metric_col] - daily_mean) / daily_std
-                unusual = daily[daily["z"].abs() >= 2.0].copy()
-                unusual["abs_z"] = unusual["z"].abs()
-                unusual = unusual.sort_values("abs_z", ascending=False).head(5)
-                anomaly_events = [
-                    {
-                        "date": str(row["day"]),
-                        "value": round(float(row[metric_col]), 2),
-                        "event_type": "spike" if float(row["z"]) > 0 else "drop",
-                        "zscore": round(float(row["z"]), 2),
-                        "deviation_pct_from_mean": round(((float(row[metric_col]) - daily_mean) / daily_mean) * 100, 2)
-                        if daily_mean
-                        else None,
-                    }
-                    for _, row in unusual.iterrows()
-                ]
+            target_series = daily[metric_col]
+        else:
+            target_series = local_df[metric_col]
 
-        signals["anomalies"] = {
-            "method": "zscore",
-            "threshold": 2.5,
-            "count": outlier_count,
-            "pct_of_rows": round((outlier_count / max(len(local_df), 1)) * 100.0, 2),
-            "events": anomaly_events,
-        }
+        series = target_series.dropna()
 
-        known_events_text = ""
-        if context is not None:
-            clarif = context.user_clarifications or {}
-            known_events_text = (clarif.get("known_events") or "").strip()
+        if len(series) < MIN_ROWS_FOR_STATS:
+            signals["anomalies"] = {
+                "method": "iqr",
+                "threshold": ANOMALY_IQR_MULTIPLIER,
+                "count": 0,
+                "pct_of_rows": 0.0,
+                "events": [],
+                "anomalies_skipped_due_to_low_volume": True,
+                "min_rows_required": MIN_ROWS_FOR_STATS,
+                "valid_rows": int(len(series)),
+            }
+            signals["quality"]["warnings"].append(
+                f"Anomaly detection skipped: aggregated to {len(series)} "
+                f"buckets, below the {MIN_ROWS_FOR_STATS}-bucket minimum."
+            )
+        else:
+            q1 = float(series.quantile(0.25))
+            q3 = float(series.quantile(0.75))
+            iqr = q3 - q1
+            median = float(series.median())
+            mean_val = float(series.mean())
+            lower = q1 - ANOMALY_IQR_MULTIPLIER * iqr
+            upper = q3 + ANOMALY_IQR_MULTIPLIER * iqr
 
-        if anomaly_events:
-            highest = anomaly_events[0]
-            high_anomaly = abs(highest.get("zscore", 0)) >= 3.5
-            base_anomaly_score = 85 if high_anomaly else 55
-            stabilize_boost = 15 if goal_consensus == "stabilize" else 0
-
-            if known_events_text:
-                message = (
-                    f"Unusual {highest['event_type']} on {highest['date']} "
-                    f"({metric_col}={highest['value']}). "
-                    f"Note: user reported known events in this period — may be expected."
-                )
-                recommendation = (
-                    f"Cross-check against reported events: \"{known_events_text[:120]}\". "
-                    "If explained, no action needed."
-                )
-                base_anomaly_score = max(30, base_anomaly_score - 20)
+            if iqr <= 0:
+                # Flat-ish series: no spread, no outliers worth surfacing.
+                signals["anomalies"] = {
+                    "method": "iqr",
+                    "threshold": ANOMALY_IQR_MULTIPLIER,
+                    "count": 0,
+                    "pct_of_rows": 0.0,
+                    "events": [],
+                    "anomalies_skipped_due_to_low_volume": False,
+                    "q1": round(q1, 4),
+                    "q3": round(q3, 4),
+                    "iqr": 0.0,
+                    "median": round(median, 4),
+                    "note": "iqr_zero_no_variance",
+                }
             else:
-                message = (
-                    f"Unusual {highest['event_type']} on {highest['date']} "
-                    f"({metric_col}={highest['value']})."
-                )
-                recommendation = (
-                    "Validate if this was campaign-driven, operational disruption, or data-quality issue."
-                )
+                outlier_mask = (series < lower) | (series > upper)
+                outlier_count = int(outlier_mask.sum())
 
-            signals["anomalies"]["known_events_context"] = known_events_text or None
-            signals["priority_insights"].append(
-                _priority_item(
-                    "anomaly_event",
-                    min(100, base_anomaly_score + stabilize_boost),
-                    message,
-                    recommendation,
-                    metric=metric_col,
-                    direction="stabilize",
-                )
-            )
-    else:
-        signals["anomalies"] = {
-            "method": "zscore",
-            "threshold": 2.5,
-            "count": 0,
-            "pct_of_rows": 0.0,
-            "events": [],
-        }
+                if daily is not None:
+                    daily_outliers = daily[
+                        (daily[metric_col] < lower) | (daily[metric_col] > upper)
+                    ].copy()
+                    daily_outliers["robust_score"] = (
+                        daily_outliers[metric_col] - median
+                    ) / iqr
+                    daily_outliers["abs_score"] = daily_outliers["robust_score"].abs()
+                    daily_outliers = daily_outliers.sort_values(
+                        "abs_score", ascending=False
+                    ).head(5)
+
+                    for _, row in daily_outliers.iterrows():
+                        value = float(row[metric_col])
+                        robust = float(row["robust_score"])
+                        deviation_pct = (
+                            ((value - mean_val) / mean_val) * 100.0
+                            if mean_val
+                            else None
+                        )
+                        anomaly_events.append(
+                            {
+                                "date": str(row["day"]),
+                                "value": round(value, 2),
+                                "event_type": "spike" if value > upper else "drop",
+                                # Kept as ``zscore`` for back-compat with the
+                                # narrator; semantically it is now an
+                                # IQR-distance from the median (signed).
+                                "zscore": round(robust, 2),
+                                "robust_score": round(robust, 2),
+                                "deviation_pct_from_mean": round(deviation_pct, 2)
+                                if deviation_pct is not None
+                                else None,
+                                "deviation_pct_from_median": (
+                                    round(((value - median) / median) * 100.0, 2)
+                                    if median
+                                    else None
+                                ),
+                            }
+                        )
+
+                signals["anomalies"] = {
+                    "method": "iqr",
+                    "threshold": ANOMALY_IQR_MULTIPLIER,
+                    "count": outlier_count,
+                    "pct_of_rows": round(
+                        (outlier_count / max(len(series), 1)) * 100.0, 2
+                    ),
+                    "events": anomaly_events,
+                    "anomalies_skipped_due_to_low_volume": False,
+                    "q1": round(q1, 4),
+                    "q3": round(q3, 4),
+                    "iqr": round(iqr, 4),
+                    "median": round(median, 4),
+                    "lower_bound": round(lower, 4),
+                    "upper_bound": round(upper, 4),
+                }
+
+                known_events_text = ""
+                if context is not None:
+                    clarif = context.user_clarifications or {}
+                    known_events_text = (clarif.get("known_events") or "").strip()
+
+                if anomaly_events:
+                    highest = anomaly_events[0]
+                    # Threshold rescaled from Z-score (3.5σ) to IQR units;
+                    # ~3 IQRs from the median is the standard "extreme" bound.
+                    high_anomaly = abs(highest.get("zscore", 0)) >= EXTREME_IQR_DISTANCE
+                    base_anomaly_score = 85 if high_anomaly else 55
+                    stabilize_boost = 15 if goal_consensus == "stabilize" else 0
+
+                    if known_events_text:
+                        message = (
+                            f"Unusual {highest['event_type']} on {highest['date']} "
+                            f"({metric_col}={highest['value']}). "
+                            f"Note: user reported known events in this period — may be expected."
+                        )
+                        recommendation = (
+                            f"Cross-check against reported events: \"{known_events_text[:120]}\". "
+                            "If explained, no action needed."
+                        )
+                        base_anomaly_score = max(30, base_anomaly_score - 20)
+                    else:
+                        message = (
+                            f"Unusual {highest['event_type']} on {highest['date']} "
+                            f"({metric_col}={highest['value']})."
+                        )
+                        recommendation = (
+                            "Validate if this was campaign-driven, operational disruption, or data-quality issue."
+                        )
+
+                    signals["anomalies"]["known_events_context"] = known_events_text or None
+                    signals["priority_insights"].append(
+                        _priority_item(
+                            "anomaly_event",
+                            min(100, base_anomaly_score + stabilize_boost),
+                            message,
+                            recommendation,
+                            metric=metric_col,
+                            direction="stabilize",
+                        )
+                    )
 
     top_contributors = signals.get("top_contributors", [])
     growth = signals.get("growth", {})

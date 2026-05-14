@@ -5,7 +5,7 @@ from typing import List
 
 from app.data_engine import SchemaInfo
 from app.llm_engine import suggest_dashboard_plan
-from app.sql_safety import is_safe_query
+from app.sql_safety import SQLValidationError, validate_select_sql
 
 
 @dataclass
@@ -191,17 +191,21 @@ def _goal_driven_items(schema: SchemaInfo, context) -> List[DashboardItem]:
     return items
 
 
-def _to_dashboard_item(raw: dict) -> tuple[DashboardItem | None, str | None]:
+def _to_dashboard_item(
+    raw: dict, schema: SchemaInfo
+) -> tuple[DashboardItem | None, str | None]:
     kind = str(raw.get("kind", "")).strip().lower()
     title = str(raw.get("title", "")).strip()
     sql = str(raw.get("sql", "")).strip()
 
     if kind not in ALLOWED_KINDS or not title or not sql:
         return None, "missing_or_invalid_fields"
-    if not is_safe_query(sql):
-        return None, "unsafe_sql"
+    try:
+        safe_sql = validate_select_sql(sql, allowed_columns=schema.columns)
+    except SQLValidationError as e:
+        return None, f"unsafe_sql:{e.code}"
     return (
-        DashboardItem(kind=kind, title=title, sql=sql, source="ai", priority_score=50),
+        DashboardItem(kind=kind, title=title, sql=safe_sql, source="ai", priority_score=50),
         None,
     )
 
@@ -310,7 +314,7 @@ def build_dashboard_plan(
         ai_items: List[DashboardItem] = []
         for raw in suggested:
             if isinstance(raw, dict):
-                item, reason = _to_dashboard_item(raw)
+                item, reason = _to_dashboard_item(raw, schema)
                 if item:
                     ai_items.append(item)
                 else:
